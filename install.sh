@@ -102,8 +102,8 @@ fi
 echo ""
 echo "[3/7] Creating log directory..."
 mkdir -p /var/log/lastech-wipe
-chmod 755 /var/log/lastech-wipe
-echo -e "      ${GRN}Log dir: /var/log/lastech-wipe/wipe.log${NC}"
+chmod 700 /var/log/lastech-wipe
+echo -e "      ${GRN}Log dir: /var/log/lastech-wipe/wipe.log (chmod 700 — root only)${NC}"
 
 # ── Install GUI script ────────────────────────────────────────────────────────
 echo ""
