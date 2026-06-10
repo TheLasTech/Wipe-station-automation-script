@@ -87,11 +87,52 @@ else
         SEDUTIL_URL=""
     fi
 
+    # Known-good SHA256 checksums for Drive Trust Alliance static binaries.
+    # *** REQUIRED: populate these before first deployment ***
+    # To get the real values, run:
+    #   curl -fsSL <SEDUTIL_URL> -o /tmp/sedutil-test && sha256sum /tmp/sedutil-test
+    # Paste the output hash below for your architecture, then re-run install.sh.
+    # If the hash below says REPLACE_WITH_REAL — the installer will abort safely.
+    SEDUTIL_SHA256_AMD64="REPLACE_WITH_REAL_AMD64_SHA256"
+    SEDUTIL_SHA256_X86="REPLACE_WITH_REAL_X86_SHA256"
+
+    if [ "$ARCH" = "x86_64" ]; then
+        EXPECTED_SHA256="$SEDUTIL_SHA256_AMD64"
+    else
+        EXPECTED_SHA256="$SEDUTIL_SHA256_X86"
+    fi
+
+    # Refuse to proceed with placeholder checksum
+    if [[ "$EXPECTED_SHA256" == REPLACE_WITH_REAL* ]]; then
+        echo -e "      ${RED}ERROR: sedutil-cli SHA256 checksum not set in install.sh.${NC}"
+        echo "      Run this to get the real hash:"
+        echo "        curl -fsSL $SEDUTIL_URL -o /tmp/sedutil-test && sha256sum /tmp/sedutil-test"
+        echo "      Then update SEDUTIL_SHA256_AMD64 or SEDUTIL_SHA256_X86 in install.sh."
+        echo "      sedutil-cli NOT installed. Fix checksums and re-run."
+        exit 1
+    fi
+
     if [ -n "$SEDUTIL_URL" ]; then
-        if curl -fsSL "$SEDUTIL_URL" -o /usr/local/bin/sedutil-cli; then
-            chmod 755 /usr/local/bin/sedutil-cli
-            echo -e "      ${GRN}sedutil-cli installed to /usr/local/bin/sedutil-cli${NC}"
+        TMPFILE=$(mktemp)
+        echo "      Downloading sedutil-cli..."
+        if curl -fsSL "$SEDUTIL_URL" -o "$TMPFILE"; then
+            # Verify SHA256 checksum before installing
+            ACTUAL_SHA256=$(sha256sum "$TMPFILE" | awk '{print $1}')
+            if [ "$ACTUAL_SHA256" = "$EXPECTED_SHA256" ]; then
+                mv "$TMPFILE" /usr/local/bin/sedutil-cli
+                chmod 755 /usr/local/bin/sedutil-cli
+                echo -e "      ${GRN}sedutil-cli installed and checksum verified.${NC}"
+            else
+                rm -f "$TMPFILE"
+                echo -e "      ${RED}ERROR: sedutil-cli checksum FAILED — binary not installed.${NC}"
+                echo "      Expected: $EXPECTED_SHA256"
+                echo "      Got:      $ACTUAL_SHA256"
+                echo "      Do not proceed until sedutil-cli is verified."
+                echo "      Manually install from: https://github.com/Drive-Trust-Alliance/sedutil"
+                echo "      Or update the SHA256 in install.sh if DTA released a new build."
+            fi
         else
+            rm -f "$TMPFILE"
             echo -e "      ${YLW}WARNING: Download failed. Install sedutil-cli manually.${NC}"
             echo "      https://github.com/Drive-Trust-Alliance/sedutil"
         fi

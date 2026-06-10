@@ -22,6 +22,8 @@ import re
 import stat
 import time
 import fcntl
+import signal
+import hashlib
 import datetime
 import tkinter as tk
 from tkinter import ttk
@@ -29,7 +31,7 @@ import threading
 import urllib.request
 import urllib.parse
 
-VERSION = "1.1"
+VERSION = "1.1.1"
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
 CONFIG_FILE   = "/etc/lastech-wipe/config.env"
@@ -205,6 +207,61 @@ def classify_drive(serial):
     return ("UNKNOWN", None)
 
 
+def known_seds_checksum():
+    """Return a stable SHA256 of the KNOWN_SEDS table contents."""
+    content = str(sorted(
+        (serial, entry["label"], entry["psid"])
+        for serial, entry in KNOWN_SEDS.items()
+    )).encode()
+    return hashlib.sha256(content).hexdigest()
+
+
+def verify_known_seds_integrity():
+    """
+    Compare current KNOWN_SEDS checksum against stored value.
+    On first run writes the baseline. On subsequent runs alerts if it changed.
+    Logs a warning if the table has been modified since last verified.
+    """
+    checksum_file = "/etc/lastech-wipe/known_seds.sha256"
+    current = known_seds_checksum()
+    try:
+        if os.path.exists(checksum_file):
+            with open(checksum_file) as f:
+                stored = f.read().strip()
+            if stored != current:
+                log_entry("WARN", "n/a", "n/a",
+                          f"KNOWN_SEDS table has changed since last verified! "
+                          f"stored={stored[:16]}... current={current[:16]}... "
+                          f"Review /usr/local/bin/lastech-wipe-gui.py before proceeding.")
+                return False
+        else:
+            # First run — write baseline
+            os.makedirs(os.path.dirname(checksum_file), exist_ok=True)
+            with open(checksum_file, "w") as f:
+                f.write(current)
+            os.chmod(checksum_file, 0o600)
+            log_entry("INFO", "n/a", "n/a",
+                      f"KNOWN_SEDS baseline checksum written: {current[:16]}...")
+    except Exception as e:
+        log_entry("WARN", "n/a", "n/a", f"KNOWN_SEDS integrity check failed: {e}")
+    return True
+
+
+# Global flag so signal handler can communicate with wipe thread
+_wipe_interrupted = threading.Event()
+
+
+def _handle_signal(signum, frame):
+    """
+    Handle SIGINT/SIGTERM during wipe — log interruption, set flag,
+    allow wipe thread to detect and abort cleanly.
+    """
+    sig_name = "SIGINT" if signum == signal.SIGINT else "SIGTERM"
+    log_entry("INTERRUPTED", "n/a", "n/a",
+              f"{sig_name} received during operation — attempting clean shutdown")
+    _wipe_interrupted.set()
+
+
 # ─── Wipe Execution ───────────────────────────────────────────────────────────
 
 def run_sed_wipe(device, psid, cb):
@@ -229,6 +286,11 @@ def _run_command(cmd, cb):
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True, bufsize=1)
         for line in proc.stdout:
+            if _wipe_interrupted.is_set():
+                proc.terminate()
+                cb("\n[INTERRUPTED] Signal received — wipe terminated.\n")
+                proc.wait()
+                return False, "".join(full)
             full.append(line)
             cb(line)
         proc.wait()
@@ -627,6 +689,13 @@ def main():
     if not stat.S_ISBLK(os.stat(device).st_mode):
         print(f"ERROR: {device} is not a block device.", file=sys.stderr)
         sys.exit(1)
+
+    # Register signal handlers before anything destructive can happen
+    signal.signal(signal.SIGINT,  _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
+
+    # Verify KNOWN_SEDS hasn't been tampered with since last run
+    verify_known_seds_integrity()
 
     if check_and_set_cooldown():
         sys.exit(0)
