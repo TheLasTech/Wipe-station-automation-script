@@ -1,0 +1,11 @@
+# LasTech Drive Wipe Station — udev rule
+# File: /etc/udev/rules.d/99-lastech-wipe.rules
+#
+# Fires when a new block device (disk, not partition) is added.
+# Launches the wipe GUI on the local display as root.
+#
+# Install:
+#   sudo cp 99-lastech-wipe.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+
+ACTION=="add", SUBSYSTEM=="block", KERNEL=="sd[b-z]", ENV{DEVTYPE}=="disk", RUN+="/usr/local/bin/lastech-wipe-trigger.sh %E{DEVNAME}"
