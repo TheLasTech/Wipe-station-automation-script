@@ -10,14 +10,16 @@ executes the appropriate wipe command with live progress output.
 Credentials: /etc/lastech-wipe/config.env  (root:root, chmod 600)
 Log:         /var/log/lastech-wipe/wipe.log
 
-Security hardened per Haiku 4.5 audit — June 2026
+Security hardened — Haiku 4.5 audits round 1 & 2, June 2026
 """
 
 import subprocess
 import sys
 import os
+import re
 import stat
 import time
+import fcntl
 import datetime
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -28,6 +30,7 @@ import urllib.parse
 # ─── Paths ────────────────────────────────────────────────────────────────────
 CONFIG_FILE   = "/etc/lastech-wipe/config.env"
 LOG_FILE      = "/var/log/lastech-wipe/wipe.log"
+LOG_DIR       = "/var/log/lastech-wipe"
 SEDUTIL_BIN   = "/usr/local/bin/sedutil-cli"
 COOLDOWN_FILE = "/tmp/lastech-wipe.cooldown"
 COOLDOWN_SECS = 30
@@ -40,7 +43,7 @@ COOLDOWN_SECS = 30
 #   1. Insert drive, run: lsblk -o NAME,SIZE,MODEL,SERIAL
 #   2. Copy serial exactly as shown
 #   3. Get PSID from physical label on the drive
-#   4. Add entry below
+#   4. Add entry below — no restart needed
 KNOWN_SEDS = {
     # Replace SERIAL_MICRON_M550 with real serial from lsblk
     "SERIAL_MICRON_M550": {
@@ -56,34 +59,35 @@ KNOWN_SEDS = {
     },
 }
 
+# ─── PSID validation ──────────────────────────────────────────────────────────
+# Accepts standard UUID format AND compact 32-char hex (some drives use either)
+_PSID_UUID    = re.compile(r'^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$')
+_PSID_COMPACT = re.compile(r'^[0-9A-F]{32}$')
+
+def validate_psid(psid):
+    """Return True if psid matches UUID or compact 32-char hex format."""
+    p = psid.upper().strip()
+    return bool(_PSID_UUID.match(p) or _PSID_COMPACT.match(p))
+
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def safe_str(val):
-    """Sanitize a value for log output — strips newlines and control chars."""
+    """Sanitize a value for log output — strip newlines and control chars."""
     return str(val).replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
 
 
-def load_config():
-    """Load Telegram credentials from config.env (key=value, no section header)."""
-    config = {}
-    try:
-        with open(CONFIG_FILE, "r") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if "=" in line:
-                    key, _, val = line.partition("=")
-                    config[key.strip()] = val.strip().strip('"').strip("'")
-    except FileNotFoundError:
-        log_entry("ERROR", "n/a", "n/a", f"Config file not found: {CONFIG_FILE}")
-    return config
+def ensure_log_dir():
+    """Create log directory with restrictive permissions (root-only)."""
+    if not os.path.exists(LOG_DIR):
+        os.makedirs(LOG_DIR, mode=0o700, exist_ok=True)
+    # Enforce even if dir already existed with wrong perms
+    os.chmod(LOG_DIR, 0o700)
 
 
 def log_entry(status, serial, model, message):
     """Append a timestamped, sanitized line to the wipe log."""
-    os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+    ensure_log_dir()
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = (f"[{timestamp}] [{safe_str(status)}] "
             f"serial={safe_str(serial)} "
@@ -96,8 +100,37 @@ def log_entry(status, serial, model, message):
         print(f"WARNING: Could not write to log: {e}", file=sys.stderr)
 
 
+def load_config():
+    """
+    Load Telegram credentials from config.env (key=value, no section header).
+    Warns to log if credentials are missing so silent notification failures
+    are caught at startup rather than discovered after a wipe.
+    """
+    config = {}
+    try:
+        with open(CONFIG_FILE, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    key, _, val = line.partition("=")
+                    config[key.strip()] = val.strip().strip('"').strip("'")
+    except FileNotFoundError:
+        log_entry("ERROR", "n/a", "n/a", f"Config file not found: {CONFIG_FILE}")
+
+    # Warn immediately if Telegram credentials are absent
+    if not config.get("TELEGRAM_BOT_TOKEN") or not config.get("TELEGRAM_CHAT_ID"):
+        log_entry("WARN", "n/a", "n/a",
+                  "Telegram credentials missing or empty in config.env — "
+                  "notifications will be disabled")
+    return config
+
+
 def send_telegram(token, chat_id, text):
     """Send a Telegram message asynchronously — never blocks the wipe."""
+    if not token or not chat_id:
+        return  # Already warned at startup via load_config
     def _send():
         try:
             url  = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -113,31 +146,43 @@ def send_telegram(token, chat_id, text):
     threading.Thread(target=_send, daemon=True).start()
 
 
-def check_cooldown():
+def check_and_set_cooldown():
     """
-    Prevent multiple GUI instances from rapid drive insertions.
-    Returns True if we're still in cooldown (caller should exit).
+    Atomically check and set the cooldown using fcntl file locking.
+    Eliminates the race condition where two processes both read before either writes.
+    Returns True if still in cooldown (caller should exit), False if clear to proceed.
     """
-    if os.path.exists(COOLDOWN_FILE):
-        try:
-            with open(COOLDOWN_FILE) as f:
-                last = float(f.read().strip())
-            if time.time() - last < COOLDOWN_SECS:
-                log_entry("SKIPPED", "n/a", "n/a",
-                          f"Cooldown active — ignoring insertion ({COOLDOWN_SECS}s window)")
-                return True
-        except Exception:
-            pass
-    return False
-
-
-def set_cooldown():
-    """Write current timestamp to cooldown file."""
     try:
-        with open(COOLDOWN_FILE, 'w') as f:
-            f.write(str(time.time()))
-    except Exception:
-        pass
+        fd = os.open(COOLDOWN_FILE, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            # Exclusive lock — only one process gets through at a time
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            content = os.read(fd, 32).decode().strip()
+            now = time.time()
+            if content:
+                try:
+                    last = float(content)
+                    if now - last < COOLDOWN_SECS:
+                        log_entry("SKIPPED", "n/a", "n/a",
+                                  f"Cooldown active — ignoring insertion ({COOLDOWN_SECS}s window)")
+                        return True
+                except ValueError:
+                    pass
+            # Write new timestamp atomically while we hold the lock
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.write(fd, str(now).encode())
+            os.ftruncate(fd, len(str(now)))
+            return False
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+    except BlockingIOError:
+        # Another process holds the lock — treat as cooldown
+        log_entry("SKIPPED", "n/a", "n/a", "Cooldown lock held by another process")
+        return True
+    except Exception as e:
+        log_entry("WARN", "n/a", "n/a", f"Cooldown check failed: {e} — proceeding")
+        return False
 
 
 def get_drive_info(device):
@@ -181,7 +226,12 @@ def classify_drive(serial):
 # ─── Wipe Execution ───────────────────────────────────────────────────────────
 
 def run_sed_wipe(device, psid, output_callback):
-    """Execute sedutil-cli PSID revert. Streams output via callback."""
+    """Execute sedutil-cli PSID revert. Validates PSID format first."""
+    if not validate_psid(psid):
+        msg = f"ERROR: PSID format invalid: {psid} — aborting wipe\n"
+        output_callback(msg)
+        log_entry("ERROR", "n/a", "n/a", msg.strip())
+        return False, msg
     output_callback(f"[SED] Initiating PSID revert on {device}...\n")
     output_callback(f"[SED] PSID: {psid}\n\n")
     return _run_command([SEDUTIL_BIN, "--PSIDrevert", psid, device], output_callback)
@@ -407,16 +457,15 @@ class WipeApp(tk.Tk):
         self.status_label.configure(
             text="Wipe in progress — do not remove drive...", fg="#fdcb6e"
         )
-        set_cooldown()
         threading.Thread(target=self._execute_wipe, daemon=True).start()
 
     def _execute_wipe(self):
-        serial    = self.drive["serial"]
-        model     = self.drive["model"]
-        device    = self.drive["device"]
-        token     = self.config_data.get("TELEGRAM_BOT_TOKEN", "")
-        chat      = self.config_data.get("TELEGRAM_CHAT_ID", "")
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        serial       = self.drive["serial"]
+        model        = self.drive["model"]
+        device       = self.drive["device"]
+        token        = self.config_data.get("TELEGRAM_BOT_TOKEN", "")
+        chat         = self.config_data.get("TELEGRAM_CHAT_ID", "")
+        timestamp    = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         method_label = "SED PSID revert" if self.drive_class == "SED" else "shred"
 
         log_entry("START", serial, model,
@@ -495,8 +544,8 @@ def main():
         print(f"ERROR: {device} is not a block device.", file=sys.stderr)
         sys.exit(1)
 
-    # Cooldown check — prevent multiple GUIs from rapid insertions
-    if check_cooldown():
+    # Atomic cooldown check — prevents stacked GUIs from rapid insertions
+    if check_and_set_cooldown():
         sys.exit(0)
 
     app = WipeApp(device)
